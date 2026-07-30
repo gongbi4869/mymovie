@@ -1,3 +1,9 @@
+날짜를 단일 날짜 선택에서 시작일~종료일 기간 선택으로 바꾸고, 지정한 기간 동안의 누적 박스오피스 데이터를 합산하여 집계하도록 수정한 전체 코드입니다.
+
+KOBIS API 특성상 기간 조회가 따로 없으므로, 선택한 기간 동안 날짜별 데이터를 순회하며 받아온 뒤 합산하도록 구현했습니다.
+
+app.py 수정 코드
+Python
 import streamlit as st
 import pandas as pd
 import requests
@@ -6,45 +12,93 @@ from zoneinfo import ZoneInfo
 
 # 1. 페이지 설정 및 제목
 st.set_page_config(page_title="박스오피스 대시보드", layout="wide")
-st.title("🎬 날짜별 & 장르별 박스오피스 대시보드")
+st.title("🎬 기간별 & 장르별 박스오피스 대시보드")
 
 # 2. 비밀 금고에서 인증키 꺼내기
 KOBIS_KEY = st.secrets["KOBIS_KEY"]
 
-# 3. 사이드바 - 날짜 선택 (기본값: 한국 시간 기준 어제)
+# 3. 사이드바 - 날짜 기간 선택 (기본값: 최근 7일간)
 today_kst = datetime.now(ZoneInfo("Asia/Seoul")).date()
-default_date = today_kst - timedelta(days=1)
+default_end = today_kst - timedelta(days=1)
+default_start = default_end - timedelta(days=6)
 
 st.sidebar.header("🔍 조회 조건 설정")
-selected_date = st.sidebar.date_input(
-    "조회 날짜 선택",
-    value=default_date,
-    max_value=default_date # 오늘 데이터는 집계 전일 수 있으므로 어제까지만 선택 가능
+selected_dates = st.sidebar.date_input(
+    "조회 기간 선택 (시작일 ~ 종료일)",
+    value=(default_start, default_end),
+    max_value=default_end # 오늘 데이터는 집계 전일 수 있어 어제까지만 선택 가능
 )
 
-# KOBIS API용 날짜 포맷팅 (YYYYMMDD)
-target_dt = selected_date.strftime("%Y%m%d")
-st.caption(f"📅 조회 기준일: {selected_date.strftime('%Y년 %m월 %d일')}")
+# date_input이 범위(튜플)로 반환될 때 처리
+if isinstance(selected_dates, (tuple, list)) and len(selected_dates) == 2:
+    start_date, end_date = selected_dates
+else:
+    st.info("💡 시작일과 종료일을 모두 선택해 주세요.")
+    st.stop()
 
-# 4. 박스오피스 API 요청 함수 (캐싱 적용)
+if start_date > end_date:
+    st.error("시작일은 종료일보다 이전이어야 합니다.")
+    st.stop()
+
+# 너무 긴 기간 조회 시 API 호출 지연 방지 (최대 31일 제한)
+date_diff = (end_date - start_date).days + 1
+if date_diff > 31:
+    st.warning("⚠️ 안정적인 조회를 위해 최대 31일(1개월) 이내의 기간만 선택해 주세요.")
+    st.stop()
+
+st.caption(f"📅 조회 기간: {start_date.strftime('%Y-%m-%d')} ~ {end_date.strftime('%Y-%m-%d')} (총 {date_diff}일간)")
+
+# 4. 단일 날짜 박스오피스 조회 함수 (캐싱)
 @st.cache_data(ttl=3600)
-def get_daily_boxoffice(key, dt):
+def fetch_daily_boxoffice(key, target_dt):
     url = "https://www.kobis.or.kr/kobisopenapi/webservice/rest/boxoffice/searchDailyBoxOfficeList.json"
-    res = requests.get(url, params={"key": key, "targetDt": dt}, timeout=10)
-    if res.status_code != 200:
-        return None, f"요청 실패 (상태코드: {res.status_code})"
-    
-    data = res.json()
-    if "faultInfo" in data:
-        return None, "인증키가 올바르지 않습니다. Secrets의 KOBIS_KEY를 확인해 주세요."
-        
-    box_list = data.get("boxOfficeResult", {}).get("dailyBoxOfficeList", [])
-    if not box_list:
-        return None, "해당 날짜의 박스오피스 데이터가 없습니다."
-        
-    return box_list, None
+    try:
+        res = requests.get(url, params={"key": key, "targetDt": target_dt}, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            if "faultInfo" not in data:
+                return data.get("boxOfficeResult", {}).get("dailyBoxOfficeList", [])
+    except:
+        pass
+    return []
 
-# 5. 영화 상세정보(장르) 조회 함수 (캐싱 적용)
+# 5. 기간 내 전체 데이터 수집 및 합산 함수
+@st.cache_data(ttl=3600)
+def get_period_boxoffice(key, start, end):
+    all_rows = []
+    curr = start
+    while curr <= end:
+        dt_str = curr.strftime("%Y%m%d")
+        daily_list = fetch_daily_boxoffice(key, dt_str)
+        for item in daily_list:
+            all_rows.append({
+                "movieCd": item["movieCd"],
+                "movieNm": item["movieNm"],
+                "openDt": item["openDt"],
+                "audiCnt": int(item["audiCnt"]),
+                "audiAcc": int(item["audiAcc"]), # 가장 최근일 기준 값 활용
+                "scrnCnt": int(item["scrnCnt"])
+            })
+        curr += timedelta(days=1)
+    
+    if not all_rows:
+        return pd.DataFrame()
+
+    df_raw = pd.DataFrame(all_rows)
+    
+    # 기간 동안 영화별 관객수 합산 및 평균 스크린수 계산
+    grouped = df_raw.groupby(["movieCd", "movieNm", "openDt"]).agg({
+        "audiCnt": "sum",       # 기간 내 총 관객수 합산
+        "audiAcc": "max",       # 가장 최근 누적 관객수
+        "scrnCnt": "max"        # 기간 중 최대 스크린수
+    }).reset_index()
+
+    # 기간 내 관객수 기준으로 순위 다시 집계
+    grouped = grouped.sort_values(by="audiCnt", ascending=False).reset_index(drop=True)
+    grouped["rank"] = grouped.index + 1
+    return grouped
+
+# 6. 영화 상세정보(장르) 조회 함수
 @st.cache_data(ttl=86400)
 def get_movie_genres(key, movie_cd):
     url = "https://www.kobis.or.kr/kobisopenapi/webservice/rest/movie/searchMovieInfo.json"
@@ -58,26 +112,19 @@ def get_movie_genres(key, movie_cd):
         pass
     return "정보 없음"
 
-# 데이터 불러오기
-box_list, error_msg = get_daily_boxoffice(KOBIS_KEY, target_dt)
+# 데이터 로딩
+with st.spinner("선택하신 기간의 박스오피스 데이터를 수집 및 집계하는 중입니다..."):
+    df = get_period_boxoffice(KOBIS_KEY, start_date, end_date)
 
-if error_msg:
-    st.error(error_msg)
+if df.empty:
+    st.error("해당 기간의 데이터를 가져오지 못했습니다. KOBIS_KEY 또는 날짜 범위를 확인해 주세요.")
     st.stop()
 
-# 6. 데이터프레임 변환 및 전처리
-df = pd.DataFrame(box_list)
-
-# 숫자형 컬럼 변환
-for col in ["rank", "audiCnt", "audiAcc", "scrnCnt", "showCnt"]:
-    df[col] = pd.to_numeric(df[col])
-
-# 각 영화별 장르 조회 (Spinner로 로딩 표시)
+# 장르 정보 추가
 with st.spinner("장르 정보를 불러오는 중입니다..."):
     df["genre"] = df["movieCd"].apply(lambda x: get_movie_genres(KOBIS_KEY, x))
 
 # 7. 사이드바 - 장르 필터 설정
-# 추출된 전체 장르 목록 만들기 (쉼표로 구분된 장르들을 모두 분리)
 all_genres = set()
 for g_str in df["genre"].dropna():
     for g in g_str.split(", "):
@@ -94,27 +141,26 @@ else:
     filtered_df = df.copy()
 
 if filtered_df.empty:
-    st.warning(f"선택하신 장르(**{selected_genre}**)에 해당하는 영화가 목록에 없습니다.")
+    st.warning(f"선택하신 장르(**{selected_genre}**)에 해당하는 영화가 해당 기간 내에 없습니다.")
     st.stop()
 
-# 8. 주요 지표 카드 표시 (필터링된 목록 중 1위)
-top = filtered_df.sort_values("rank").iloc[0]
+# 8. 주요 지표 카드 표시 (선택 기간 내 관객수 1위)
+top = filtered_df.iloc[0]
 c1, c2, c3 = st.columns(3)
-c1.metric("선택 범위 1위", top["movieNm"])
-c2.metric("당일 관객수", f"{top['audiCnt']:,}명")
-c3.metric("누적 관객수", f"{top['audiAcc']:,}명")
+c1.metric("기간 내 1위 영화", top["movieNm"])
+c2.metric("기간 총 관객수", f"{top['audiCnt']:,}명")
+c3.metric("최신 누적 관객수", f"{top['audiAcc']:,}명")
 
 st.markdown("---")
 
 # 9. 표 레이아웃 정리 및 출력
 table = filtered_df[["rank", "movieNm", "genre", "openDt", "audiCnt", "audiAcc", "scrnCnt"]].copy()
-table.columns = ["순위", "영화명", "장르", "개봉일", "관객수", "누적관객", "스크린수"]
-table = table.sort_values("순위").reset_index(drop=True)
+table.columns = ["순위", "영화명", "장르", "개봉일", "기간내 관객수", "누적관객", "최대 스크린수"]
 
-st.subheader(f"📋 박스오피스 목록 ({'전체' if selected_genre == '전체' else selected_genre})")
+st.subheader(f"📋 기간 누적 박스오피스 목록 ({'전체' if selected_genre == '전체' else selected_genre})")
 st.dataframe(table, use_container_width=True)
 
-# 10. 시각화 (관객수 상위 영화)
-st.subheader("📈 관객수 상위 영화")
-top_chart = table.sort_values("관객수", ascending=False).head(5)
-st.bar_chart(top_chart.set_index("영화명")["관객수"])
+# 10. 시각화 (기간내 관객수 상위 영화)
+st.subheader("📈 기간 내 관객수 상위 5편")
+top_chart = table.head(5)
+st.bar_chart(top_chart.set_index("영화명")["기간내 관객수"])
