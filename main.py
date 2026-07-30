@@ -1,9 +1,3 @@
-날짜를 단일 날짜 선택에서 시작일~종료일 기간 선택으로 바꾸고, 지정한 기간 동안의 누적 박스오피스 데이터를 합산하여 집계하도록 수정한 전체 코드입니다.
-
-KOBIS API 특성상 기간 조회가 따로 없으므로, 선택한 기간 동안 날짜별 데이터를 순회하며 받아온 뒤 합산하도록 구현했습니다.
-
-app.py 수정 코드
-Python
 import streamlit as st
 import pandas as pd
 import requests
